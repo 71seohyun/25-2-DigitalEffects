@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Generative Point Cloud Art</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; }
+        canvas { display: block; }
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            backdrop-filter: blur(5px);
+        }
+        input[type="file"] {
+            color: #fff;
+        }
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            font-size: 1.2rem;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-container">
+        <h3>Image Upload</h3>
+        <input type="file" id="fileInput" accept="image/*">
+        <p style="font-size: 0.8rem; color: #aaa;">이미지를 업로드하면 3D 포인트 클라우드로 변환됩니다.</p>
+    </div>
+    <div id="loading" class="loading">Generating Particles...</div>
+
+    <!-- Import Map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // --- Global Variables ---
+        let scene, camera, renderer, controls;
+        let particles, material, geometry;
+        let gui;
+        const clock = new THREE.Clock();
+
+        // --- Parameters Object (For GUI) ---
+        const params = {
+            // Group 1: Physics / Noise
+            particleSize: 2.5,
+            displacement: 50.0,
+            noiseSpeed: 0.5,
+            noiseFreq: 0.5,
+            noiseAmp: 5.0,
+            
+            // Group 2: Image / Neural Style
+            distortion: 0.0,
+            brightness: 1.0,
+            colorR: 1.0,
+            colorG: 1.0,
+            colorB: 1.0,
+            bgColor: '#050505' // Background color
+        };
+
+        // --- GLSL Shaders ---
+        // Vertex Shader: Handles position, displacement, and noise
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uDisplacement;
+            uniform float uNoiseSpeed;
+            uniform float uNoiseFreq;
+            uniform float uNoiseAmp;
+            uniform float uDistortion;
+            uniform float uSize;
+            uniform sampler2D uTexture;
+            
+            varying vec2 vUv;
+            varying vec3 vColor;
+            varying float vVisible;
+
+            // Simplex Noise Function
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+            float snoise(vec2 v) {
+                const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                        -0.577350269189626, 0.024390243902439);
+                vec2 i  = floor(v + dot(v, C.yy) );
+                vec2 x0 = v - i + dot(i, C.xx);
+                vec2 i1;
+                i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+                vec4 x12 = x0.xyxy + C.xxzz;
+                x12.xy -= i1;
+                i = mod289(i);
+                vec3 p = permute( permute( i.y + vec3(0.0, i1.y, 1.0 ))
+                    + i.x + vec3(0.0, i1.x, 1.0 ));
+                vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+                m = m*m ;
+                m = m*m ;
+                vec3 x = 2.0 * fract(p * C.www) - 1.0;
+                vec3 h = abs(x) - 0.5;
+                vec3 ox = floor(x + 0.5);
+                vec3 a0 = x - ox;
+                m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
+                vec3 g;
+                g.x  = a0.x  * x0.x  + h.x  * x0.y;
+                g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+                return 130.0 * dot(m, g);
+            }
+
+            void main() {
+                vUv = uv;
+                
+                // Get color from texture
+                vec4 imgColor = texture2D(uTexture, uv);
+                vColor = imgColor.rgb;
+                
+                // Calculate brightness for Z displacement
+                float brightness = dot(vColor, vec3(0.299, 0.587, 0.114));
+                
+                // Calculate Noise
+                float noiseVal = snoise(uv * uNoiseFreq + uTime * uNoiseSpeed);
+                
+                vec3 newPos = position;
+                
+                // 1. Z-Displacement based on brightness
+                newPos.z += brightness * uDisplacement;
+                
+                // 2. Add Noise wave
+                newPos.z += noiseVal * uNoiseAmp;
+                
+                // 3. Distortion (warp x/y based on noise and brightness)
+                newPos.x += noiseVal * uDistortion * brightness;
+                newPos.y += noiseVal * uDistortion * brightness;
+
+                vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                
+                // Size attenuation based on depth
+                gl_PointSize = uSize * (300.0 / -mvPosition.z);
+            }
+        `;
+
+        // Fragment Shader: Handles color, shape (circle), and brightness
+        const fragmentShader = `
+            uniform float uBrightness;
+            uniform vec3 uColorFilter;
+
+            varying vec2 vUv;
+            varying vec3 vColor;
+
+            void main() {
+                // Circular Particle Shape (Neural Point Cloud style)
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                if(length(coord) > 0.5) discard;
+
+                // Final Color Calculation
+                vec3 finalColor = vColor * uColorFilter * uBrightness;
+
+                // Add a slight glow/soft edge effect
+                float dist = length(coord);
+                float alpha = 1.0 - smoothstep(0.4, 0.5, dist);
+
+                gl_FragColor = vec4(finalColor, alpha);
+            }
+        `;
+
+        init();
+        animate();
+
+        function init() {
+            // 1. Scene Setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(params.bgColor);
+            scene.fog = new THREE.FogExp2(params.bgColor, 0.002);
+
+            // 2. Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, -50, 100); // Tilted view
+            camera.lookAt(0, 0, 0);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            // 4. Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            // 5. GUI Setup
+            setupGUI();
+
+            // 6. Default Image Load (Optional: Create a placeholder or wait for upload)
+            // Listen for file upload
+            document.getElementById('fileInput').addEventListener('change', handleImageUpload);
+            
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function setupGUI() {
+            gui = new GUI();
+            
+            const physicsFolder = gui.addFolder('Physics & Noise');
+            physicsFolder.add(params, 'particleSize', 0.1, 10.0).name('Particle Size').onChange(updateUniforms);
+            physicsFolder.add(params, 'displacement', 0, 200).name('Displacement').onChange(updateUniforms);
+            physicsFolder.add(params, 'noiseSpeed', 0, 2.0).name('Noise Speed').onChange(updateUniforms);
+            physicsFolder.add(params, 'noiseFreq', 0.1, 5.0).name('Noise Frequency').onChange(updateUniforms);
+            physicsFolder.add(params, 'noiseAmp', 0, 50.0).name('Noise Amplitude').onChange(updateUniforms);
+            physicsFolder.open();
+
+            const imageFolder = gui.addFolder('Image Controls');
+            imageFolder.add(params, 'distortion', 0, 50.0).name('Distortion').onChange(updateUniforms);
+            imageFolder.add(params, 'brightness', 0, 5.0).name('Bright').onChange(updateUniforms);
+            imageFolder.addColor(params, 'bgColor').name('Background').onChange(val => {
+                scene.background.set(val);
+                scene.fog.color.set(val);
+            });
+            
+            const colorSub = imageFolder.addFolder('Color Filter');
+            colorSub.add(params, 'colorR', 0, 2).name('Red').onChange(updateUniforms);
+            colorSub.add(params, 'colorG', 0, 2).name('Green').onChange(updateUniforms);
+            colorSub.add(params, 'colorB', 0, 2).name('Blue').onChange(updateUniforms);
+            imageFolder.open();
+        }
+
+        function updateUniforms() {
+            if (material) {
+                material.uniforms.uSize.value = params.particleSize;
+                material.uniforms.uDisplacement.value = params.displacement;
+                material.uniforms.uNoiseSpeed.value = params.noiseSpeed;
+                material.uniforms.uNoiseFreq.value = params.noiseFreq;
+                material.uniforms.uNoiseAmp.value = params.noiseAmp;
+                material.uniforms.uDistortion.value = params.distortion;
+                material.uniforms.uBrightness.value = params.brightness;
+                material.uniforms.uColorFilter.value.set(params.colorR, params.colorG, params.colorB);
+            }
+        }
+
+        function handleImageUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            document.getElementById('loading').style.opacity = 1;
+
+            reader.onload = function(e) {
+                const img = new Image();
+                img.onload = function() {
+                    createPointCloud(img);
+                    document.getElementById('loading').style.opacity = 0;
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function createPointCloud(image) {
+            // Remove old particles
+            if (particles) {
+                scene.remove(particles);
+                geometry.dispose();
+                material.dispose();
+            }
+
+            // Create Texture from Image
+            const texture = new THREE.Texture(image);
+            texture.needsUpdate = true;
+
+            // Geometry Strategy: Create a grid of points relative to image aspect ratio
+            // To maintain performance, we limit the resolution (e.g., max 300px width)
+            const maxRes = 300; 
+            let width = image.width;
+            let height = image.height;
+            
+            const aspect = width / height;
+            if (width > maxRes) {
+                width = maxRes;
+                height = Math.round(width / aspect);
+            }
+
+            geometry = new THREE.PlaneGeometry(100 * aspect, 100, width, height);
+
+            // Shader Material
+            material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uTexture: { value: texture },
+                    uSize: { value: params.particleSize },
+                    uDisplacement: { value: params.displacement },
+                    uNoiseSpeed: { value: params.noiseSpeed },
+                    uNoiseFreq: { value: params.noiseFreq },
+                    uNoiseAmp: { value: params.noiseAmp },
+                    uDistortion: { value: params.distortion },
+                    uBrightness: { value: params.brightness },
+                    uColorFilter: { value: new THREE.Vector3(params.colorR, params.colorG, params.colorB) }
+                },
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending // Gives the "glowing" look
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const elapsedTime = clock.getElapsedTime();
+
+            if (material) {
+                material.uniforms.uTime.value = elapsedTime;
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
