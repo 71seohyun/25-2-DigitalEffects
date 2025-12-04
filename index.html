@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>드로잉 자료 생성기 (2D Enhanced)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #222; font-family: 'Pretendard', sans-serif; }
+        
+        /* 메인 컨테이너 */
+        #container { position: relative; width: 100vw; height: 100vh; }
+        
+        /* 웹캠 오버레이 (좌측 상단) */
+        #webcam-wrapper { 
+            position: absolute; top: 20px; left: 20px; z-index: 10; 
+            width: 240px; height: 180px; 
+            border: 3px solid rgba(255,255,255,0.8); 
+            border-radius: 12px; overflow: hidden; background: #000; 
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+        }
+        #input_video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        
+        /* 카운트다운 텍스트 */
+        #countdown-text { 
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            font-size: 80px; color: #fff; font-weight: 900; 
+            text-shadow: 0 0 10px rgba(0,0,0,0.8); display: none; pointer-events: none; z-index: 100;
+        }
+
+        /* 뷰어 영역 (Three.js Canvas) */
+        #canvas-container { width: 100%; height: 100%; background-color: #333; cursor: grab; }
+        #canvas-container:active { cursor: grabbing; }
+
+        /* 하단 컨트롤 패널 */
+        #controls { 
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%); 
+            display: flex; gap: 15px; z-index: 20; 
+            background: rgba(30,30,30,0.8); padding: 15px 25px; 
+            border-radius: 50px; backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }
+        
+        button { 
+            padding: 12px 24px; border: none; border-radius: 25px; 
+            font-size: 15px; cursor: pointer; transition: 0.2s; font-weight: bold; 
+            color: white; outline: none;
+        }
+        button:active { transform: scale(0.95); }
+
+        #btn-mode { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        #btn-save { background: linear-gradient(135deg, #ff6a00 0%, #ee0979 100%); }
+        #status-msg {
+            position: absolute; top: 20px; right: 20px;
+            color: rgba(255,255,255,0.7); font-size: 14px;
+            background: rgba(0,0,0,0.5); padding: 8px 12px; border-radius: 8px;
+            pointer-events: none;
+        }
+
+    </style>
+</head>
+<body>
+
+    <div id="countdown-text">3</div>
+    <div id="status-msg">휠: 확대/축소 | 드래그: 이동</div>
+
+    <!-- 웹캠 영역 -->
+    <div id="webcam-wrapper">
+        <video id="input_video" autoplay playsinline></video>
+    </div>
+
+    <!-- 뷰어 영역 -->
+    <div id="canvas-container"></div>
+
+    <!-- 버튼들 -->
+    <div id="controls">
+        <button id="btn-mode">🎨 모드 변경 (기본)</button>
+        <button id="btn-save">💾 이미지 저장</button>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+    <script>
+        // --- 1. 설정 및 변수 ---
+        const videoElement = document.getElementById('input_video');
+        const countdownEl = document.getElementById('countdown-text');
+        const btnMode = document.getElementById('btn-mode');
+        const btnSave = document.getElementById('btn-save');
+        const container = document.getElementById('canvas-container');
+
+        let isCountingDown = false;
+        let currentMode = 0; // 0: Normal, 1: LineArt, 2: Posterize
+        const modeNames = ["기본", "선화 (깔끔)", "포스터라이즈"];
+        
+        // --- 2. Three.js (2D 뷰어 모드) 설정 ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222); // 배경색
+
+        // OrthographicCamera 사용 (원근감 없는 2D 카메라)
+        // 화면 크기에 맞춰 절두체 설정
+        const aspect = window.innerWidth / window.innerHeight;
+        const frustumSize = 2; // 보여질 높이 크기 (임의 설정)
+        const camera = new THREE.OrthographicCamera(
+            frustumSize * aspect / -2, frustumSize * aspect / 2, 
+            frustumSize / 2, frustumSize / -2, 
+            0.1, 1000
+        );
+        camera.position.z = 10;
+        camera.zoom = 1; // 줌 레벨
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        container.appendChild(renderer.domElement);
+
+        // 이미지 평면 (Geometry)
+        const geometry = new THREE.PlaneGeometry(1, 1); // 텍스처 로드 시 비율 조정 예정
+
+        // --- 3. 쉐이더 (GLSL) 작성 ---
+        // 텍스처 좌표만 넘기는 기본 버텍스 쉐이더
+        const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        // 핵심 프래그먼트 쉐이더 (선화 개선 및 포스터라이즈)
+        const fragmentShader = `
+            uniform sampler2D tDiffuse;
+            uniform int uMode; // 0: Normal, 1: Line, 2: Posterize
+            uniform vec2 uResolution;
+            varying vec2 vUv;
+
+            // 그레이스케일 변환 함수
+            float getLuminance(vec3 color) {
+                return dot(color, vec3(0.299, 0.587, 0.114));
+            }
+
+            void main() {
+                vec4 texColor = texture2D(tDiffuse, vUv);
+
+                if (uMode == 1) { 
+                    // [모드 1: 깔끔한 선화]
+                    
+                    float w = 1.0 / uResolution.x;
+                    float h = 1.0 / uResolution.y;
+                    
+                    // 1. Sobel Edge Detection (주변 픽셀 샘플링)
+                    // 약간 넓게 샘플링하여 자잘한 노이즈 무시 (step 1.5)
+                    float step = 1.5; 
+                    
+                    float tl = getLuminance(texture2D(tDiffuse, vUv + vec2(-w, -h) * step).rgb);
+                    float t  = getLuminance(texture2D(tDiffuse, vUv + vec2( 0, -h) * step).rgb);
+                    float tr = getLuminance(texture2D(tDiffuse, vUv + vec2( w, -h) * step).rgb);
+                    float l  = getLuminance(texture2D(tDiffuse, vUv + vec2(-w,  0) * step).rgb);
+                    float r  = getLuminance(texture2D(tDiffuse, vUv + vec2( w,  0) * step).rgb);
+                    float bl = getLuminance(texture2D(tDiffuse, vUv + vec2(-w,  h) * step).rgb);
+                    float b  = getLuminance(texture2D(tDiffuse, vUv + vec2( 0,  h) * step).rgb);
+                    float br = getLuminance(texture2D(tDiffuse, vUv + vec2( w,  h) * step).rgb);
+
+                    float x = (tr + 2.0 * r + br) - (tl + 2.0 * l + bl);
+                    float y = (bl + 2.0 * b + br) - (tl + 2.0 * t + tr);
+                    
+                    float edge = sqrt(x*x + y*y);
+
+                    // 2. Thresholding (임계값 적용)
+                    // edge 값이 0.15보다 작으면 0(흰색 배경이 됨), 크면 진하게
+                    // smoothstep으로 경계를 부드럽지만 단단하게 만듦
+                    float line = smoothstep(0.1, 0.3, edge);
+
+                    // 3. 반전 (검은 배경->흰선 => 흰 배경->검은선)
+                    vec3 finalColor = vec3(1.0 - line);
+
+                    gl_FragColor = vec4(finalColor, 1.0);
+
+                } else if (uMode == 2) { 
+                    // [모드 2: 포스터라이즈 (색상 단순화)]
+                    
+                    float levels = 5.0; // 색상 단계 수
+                    vec3 c = texColor.rgb;
+                    
+                    // 감마 보정 느낌으로 채도를 약간 올린 후 단계화하면 더 예쁨
+                    // c = pow(c, vec3(0.8)); 
+
+                    c = floor(c * levels) / levels;
+                    
+                    gl_FragColor = vec4(c, 1.0);
+
+                } else {
+                    // [모드 0: 기본]
+                    gl_FragColor = texColor;
+                }
+            }
+        `;
+
+        const uniforms = {
+            tDiffuse: { value: null },
+            uMode: { value: 0 },
+            uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) }
+        };
+
+        const material = new THREE.ShaderMaterial({
+            uniforms: uniforms,
+            vertexShader: vertexShader,
+            fragmentShader: fragmentShader,
+            side: THREE.DoubleSide
+        });
+
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+
+        // 초기 안내용 텍스처
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 640; tempCanvas.height = 480;
+        const tCtx = tempCanvas.getContext('2d');
+        tCtx.fillStyle = '#111'; tCtx.fillRect(0,0,640,480);
+        tCtx.fillStyle = '#888'; tCtx.font = 'bold 30px sans-serif'; tCtx.textAlign = 'center'; tCtx.textBaseline = 'middle';
+        tCtx.fillText("웹캠에 손바닥을 보여주세요", 320, 240);
+        const initialTex = new THREE.CanvasTexture(tempCanvas);
+        uniforms.tDiffuse.value = initialTex;
+        mesh.scale.set(1.33, 1, 1); // 4:3 비율
+
+        // --- 4. 마우스 이벤트 (Pan & Zoom) ---
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+
+        container.addEventListener('mousedown', (e) => { isDragging = true; previousMousePosition = { x: e.clientX, y: e.clientY }; });
+        window.addEventListener('mouseup', () => { isDragging = false; });
+        
+        container.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                const deltaMove = { x: e.clientX - previousMousePosition.x, y: e.clientY - previousMousePosition.y };
+                
+                // Pan 이동 (Zoom 레벨에 따라 속도 조절)
+                const moveSpeed = 0.002 / camera.zoom; 
+                camera.position.x -= deltaMove.x * moveSpeed * (window.innerWidth/window.innerHeight);
+                camera.position.y += deltaMove.y * moveSpeed; 
+                
+                previousMousePosition = { x: e.clientX, y: e.clientY };
+            }
+        });
+
+        container.addEventListener('wheel', (e) => {
+            const zoomSpeed = 0.001;
+            camera.zoom += e.deltaY * -zoomSpeed * camera.zoom; // 현재 줌 비례 확대/축소
+            camera.zoom = Math.max(0.1, Math.min(camera.zoom, 10)); // 줌 제한
+            camera.updateProjectionMatrix();
+        });
+
+        // 윈도우 리사이즈
+        window.addEventListener('resize', () => {
+            const aspect = window.innerWidth / window.innerHeight;
+            camera.left = -frustumSize * aspect / 2;
+            camera.right = frustumSize * aspect / 2;
+            camera.top = frustumSize / 2;
+            camera.bottom = -frustumSize / 2;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+
+        // --- 5. MediaPipe & 로직 ---
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8, minTrackingConfidence: 0.5 });
+        
+        hands.onResults((results) => {
+            if (!isCountingDown && results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                startCountdown();
+            }
+        });
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 640, height: 480
+        });
+        cameraUtils.start();
+
+        function startCountdown() {
+            isCountingDown = true;
+            countdownEl.style.display = 'block';
+            let count = 3;
+            countdownEl.innerText = count;
+
+            const timer = setInterval(() => {
+                count--;
+                if (count > 0) {
+                    countdownEl.innerText = count;
+                } else {
+                    clearInterval(timer);
+                    countdownEl.style.display = 'none';
+                    capturePhoto();
+                    // 쿨타임
+                    setTimeout(() => { isCountingDown = false; }, 2500);
+                }
+            }, 1000);
+        }
+
+        function capturePhoto() {
+            // 캔버스에 현재 프레임 캡처
+            const captureCanvas = document.createElement('canvas');
+            captureCanvas.width = videoElement.videoWidth;
+            captureCanvas.height = videoElement.videoHeight;
+            const ctx = captureCanvas.getContext('2d');
+            
+            // 좌우 반전 (거울 모드 보정)
+            ctx.translate(captureCanvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(videoElement, 0, 0);
+
+            // Three.js 텍스처 업데이트
+            const newTexture = new THREE.CanvasTexture(captureCanvas);
+            newTexture.minFilter = THREE.LinearFilter;
+            newTexture.magFilter = THREE.LinearFilter;
+            
+            uniforms.tDiffuse.value = newTexture;
+            uniforms.uResolution.value.set(captureCanvas.width, captureCanvas.height);
+
+            // 이미지 비율에 맞춰 Mesh 크기 조절
+            const imgAspect = captureCanvas.width / captureCanvas.height;
+            mesh.scale.set(imgAspect, 1, 1);
+            
+            // 카메라 및 위치 초기화 (보기 좋게)
+            camera.zoom = 1.0; // 꽉 차게 보이도록 조정
+            camera.position.set(0,0,10);
+            camera.updateProjectionMatrix();
+
+            console.log("Captured!");
+        }
+
+        // --- 6. 버튼 이벤트 ---
+        btnMode.addEventListener('click', () => {
+            currentMode = (currentMode + 1) % 3;
+            uniforms.uMode.value = currentMode;
+            btnMode.innerText = `🎨 모드: ${modeNames[currentMode]}`;
+        });
+
+        btnSave.addEventListener('click', () => {
+            renderer.render(scene, camera);
+            const link = document.createElement('a');
+            link.download = `ref_image_${modeNames[currentMode]}_${Date.now()}.png`;
+            link.href = renderer.domElement.toDataURL("image/png");
+            link.click();
+        });
+
+    </script>
+</body>
+</html>
